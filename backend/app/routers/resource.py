@@ -73,6 +73,47 @@ def export_entries(
     )
 
 
+@router.get("/call_audit/archives", response_model=list[dict])
+def list_audit_archives() -> list[dict[str, Any]]:
+    """调用审计：列出审计归档交付物。"""
+    from app.services.data_manager import list_audit_archives as _list
+
+    return _list()
+
+
+@router.get("/call_audit/archives/{before_date}", response_model=dict)
+def get_audit_archive(before_date: str) -> dict[str, Any]:
+    """调用审计：按归档日期读取历史归档交付物。"""
+    from app.services.data_manager import read_audit_archive
+
+    archive = read_audit_archive(before_date)
+    if not archive:
+        raise HTTPException(status_code=404, detail=f"归档 {before_date} 不存在")
+    return archive
+
+
+@router.get("/call_audit/history", response_model=list[dict])
+def query_audit_history(
+    start_date: str | None = Query(default=None),
+    end_date: str | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    """调用审计：按日期从审计归档处复核历史真实调用明细。"""
+    from app.services.data_manager import query_audit_archive
+
+    return query_audit_archive(start_date=start_date, end_date=end_date)
+
+
+@router.post("/call_audit/backfill", response_model=ActionResult)
+def backfill_audit(payload: EntryPayload) -> ActionResult:
+    """调用审计：补录一条迟到的真实调用明细。"""
+    service = require_service("call_audit")
+    try:
+        entry = service.backfill_audit_record(**payload.values)
+    except ValueError as error:
+        return ActionResult(ok=False, message=str(error))
+    return ActionResult(ok=True, message="迟到调用明细已补录", entry=entry)
+
+
 @router.get("/{module}/{entry_id}", response_model=dict)
 def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     service = require_service(module)

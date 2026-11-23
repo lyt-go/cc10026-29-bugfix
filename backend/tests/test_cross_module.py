@@ -524,3 +524,127 @@ class TestCrossModuleFlows:
         # 验证所有关键模块都有产出
         assert store.find("api_registry", api_entry["id"]) is not None
         print("完整生命周期测试通过")
+
+
+class TestCallAuditArchive:
+    """调用审计归档回归：归档划分、重复执行、迟到明细与对账。"""
+
+    BOUNDARY = "2026-09-10"
+
+    def setup_method(self):
+        """每个测试前重建store并清空数据目录，避免归档用例互相串扰。"""
+        import shutil
+        from app.seed import SEED_ROWS
+        from app.store import store as s
+
+        s._tables = {name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()}
+        if os.path.exists(temp_data):
+            shutil.rmtree(temp_data, ignore_errors=True)
+
+    def _write_call(self, audit_id, record_no, api, ts, logged_at):
+        from app.services.data_manager import write_audit
+
+        write_audit(audit_id, {
+            "audit_id": audit_id,
+            "record_no": record_no,
+            "caller": "alice",
+            "api_name": api,
+            "request_params": "id=1",
+            "response_code": "200",
+            "latency_ms": 10.0,
+            "result_rows": 2,
+            "timestamp": ts,
+        }, logged_at=logged_at)
+
+    def _seed_two_calls(self):
+        self._write_call(1, "CALL-0001", "API-A",
+                         "2026-09-01T10:00:00+08:00", "2026-09-01T10:00:01+08:00")
+        self._write_call(2, "CALL-0002", "API-A",
+                         "2026-09-02T11:00:00+08:00", "2026-09-02T11:00:01+08:00")
+        self._write_call(3, "CALL-0003", "API-B",
+                         "2026-09-10T09:00:00+08:00", "2026-09-10T09:00:01+08:00")
+
+    def test_archive_excludes_archive_artifact_and_preserves_times(self):
+        """归档只收真实调用，不把归档交付物当调用，也不改写原始时间。"""
+        import os
+        from app.services import data_manager as dm
+        from app.services.call_audit import CallAuditService
+
+        self._seed_two_calls()
+        svc = CallAuditService()
+        result = svc.archive_old_records(self.BOUNDARY)
+        assert result["archived_count"] == 2
+        assert result["late_record_nos"] == []
+        # 边界日当天不计入该归档日期
+        assert "CALL-0003" not in {r["record_no"] for r in result["records"]}
+        # 原始调用时间与日志写入时间保持原值
+        record = dm.read_audit(1)
+        assert record["timestamp"] == "2026-09-01T10:00:00+08:00"
+        assert record["_logged_at"] == "2026-09-01T10:00:01+08:00"
+        assert record["status"] == "已归档"
+        # 没有产生伪调用文件，归档交付物不出现在调用明细里
+        assert not os.path.exists(dm.DATA_ROOT / "audit" / "000000.json")
+        assert {r["record_no"] for r in dm.list_audit()} == {"CALL-0001", "CALL-0002", "CALL-0003"}
+
+    def test_rerun_without_new_records_keeps_archive_reference(self):
+        """无新增记录重跑：原归档引用与取数范围保持不变。"""
+        from app.services import data_manager as dm
+        from app.services.call_audit import CallAuditService
+
+        self._seed_two_calls()
+        svc = CallAuditService()
+        first = svc.archive_old_records(self.BOUNDARY)
+        first_logged = dm.read_audit(1)["_logged_at"]
+
+        second = svc.archive_old_records(self.BOUNDARY)
+        assert second["archive_date"] == first["archive_date"]
+        assert second["archived_count"] == first["archived_count"] == 2
+        assert second["records"] == first["records"]
+        assert dm.read_audit(1)["_logged_at"] == first_logged
+
+    def test_late_call_lands_in_same_archive_and_rerun_reconciles(self):
+        """迟到明细再次归档归位到原日期，并能与归档错位/日志丢失区分。"""
+        import json
+        import os
+        from app.services import data_manager as dm
+        from app.services.call_audit import CallAuditService
+
+        self._seed_two_calls()
+        svc = CallAuditService()
+        first = svc.archive_old_records(self.BOUNDARY)
+
+        # 迟到但真实：调用时间落在归档日期内，日志写入时间很晚
+        svc.backfill_audit_record(
+            record_no="CALL-0004", caller="alice", api_name="API-A",
+            call_time="2026-09-03T08:30:00+08:00",
+            logged_at="2026-09-11T16:00:00+08:00",
+        )
+        second = svc.archive_old_records(self.BOUNDARY)
+        assert second["archive_date"] == first["archive_date"]
+        assert second["archived_count"] == 3
+        assert second["late_record_nos"] == ["CALL-0004"]
+        # 迟到明细的时间在再次归档后仍是原值
+        late = [r for r in second["records"] if r["record_no"] == "CALL-0004"][0]
+        assert late["timestamp"] == "2026-09-03T08:30:00+08:00"
+        assert late["_logged_at"] == "2026-09-11T16:00:00+08:00"
+
+        # 历史归档可按日期复核，并保留真实来源
+        history = svc.query_archived_records(start_date=self.BOUNDARY, end_date=self.BOUNDARY)
+        assert {h["record_no"] for h in history} == {
+            "CALL-0001", "CALL-0002", "CALL-0004"}
+        assert all(h["_archive_before_date"] == self.BOUNDARY for h in history)
+
+        # 制造原始日志丢失与归档内容错位
+        os.remove(dm.DATA_ROOT / "audit" / "000002.json")
+        archive_path = dm.DATA_ROOT / "audit" / f"_archive_{self.BOUNDARY}.json"
+        archive = json.loads(archive_path.read_text(encoding="utf-8"))
+        for record in archive["records"]:
+            if record["record_no"] == "CALL-0001":
+                record["timestamp"] = "2026-09-20T00:00:00+08:00"
+        archive_path.write_text(json.dumps(archive, ensure_ascii=False), encoding="utf-8")
+
+        final = svc.archive_old_records(self.BOUNDARY)
+        assert "CALL-0002" in final["missing_record_nos"]
+        assert "CALL-0001" in final["misplaced_record_nos"]
+        assert final["reconciliation"]["missing_count"] == 1
+        assert final["reconciliation"]["misplaced_count"] == 1
